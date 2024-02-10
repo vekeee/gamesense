@@ -1,0 +1,1050 @@
+local clipboard = require("gamesense/clipboard") or error("Missing Clipboard: https://gamesense.pub/forums/viewtopic.php?id=28678", 2)
+local base64 = require("gamesense/base64") or error("Missing Base64: https://gamesense.pub/forums/viewtopic.php?id=21619", 2)
+local vector = require("vector") or error("Missing Vector", 2)
+local ffi = require("ffi") or error("Please turn on Allow unsafe scripts!", 2)
+local http = require("gamesense/http") or error("Missing http: https://gamesense.pub/forums/viewtopic.php?id=19253", 2)
+
+local defr, defg, defb, defa = 191, 191, 236, 255
+
+local function gradient_rgb(r1, g1, b1, a1, text)
+    if #text == 0 then
+        return "" -- Return an empty string if the text is empty
+    end
+
+    local r2, g2, b2, a2 = 255, 255, 255, 255 -- Default final RGB and A values
+    local output = ""
+    local len = #text - 1
+    if len <= 0 then
+        -- If the text length is too short, handle it accordingly
+        return ("\a%02x%02x%02x%02x%s"):format(r1, g1, b1, a1, text)
+    end
+
+    local rinc = (r2 - r1) / len
+    local ginc = (g2 - g1) / len
+    local binc = (b2 - b1) / len
+    local ainc = (a2 - a1) / len
+
+    for i = 1, len + 1 do
+        output = output .. ("\a%02x%02x%02x%02x%s"):format(r1, g1, b1, a1, text:sub(i, i))
+        r1 = r1 + rinc
+        g1 = g1 + ginc
+        b1 = b1 + binc
+        a1 = a1 + ainc
+    end
+
+    return output
+end
+
+local text_to_slidedraw = {
+    one = "%s"
+}
+
+local function slidetoHex(value)
+    local hexChars = "0123456789ABCDEF"
+    local output = ""
+    
+    while value > 0 do
+        local index = value % 16 + 1
+        value = math.floor(value / 16)
+        output = string.sub(hexChars, index, index) .. output
+    end
+    
+    if #output == 0 then 
+        output = "00" 
+    elseif #output == 1 then 
+        output = "0" .. output 
+    end 
+    
+    return output
+end
+
+local function slideconvertToHex(arg)
+    local result = "\a"
+    
+    for _, value in ipairs(arg) do
+        result = result .. slidetoHex(value)
+    end 
+    
+    return result .. "FF"
+end
+
+local lua_enable = ui.new_label("AA", "Anti-aimbot angles", "%s")
+local function gradient_rgbslide()
+	if not ui.is_menu_open() then return nil end
+    local textToDraw = "(v4.5) nemesis"
+    local r2, g2, b2, a2 = defr, defg, defb, defa
+    local highlightFraction = (globals.realtime() / 2 % 1.2 * 2) - 1.2
+    local formattedText = ""
+
+    for idx = 1, #textToDraw do
+        local character = textToDraw:sub(idx, idx)
+        local characterFraction = idx / #textToDraw
+        local r1, g1, b1, a1 = 255, 255, 255, 255
+        local highlightDelta = (characterFraction - highlightFraction)
+
+        if highlightDelta >= 0 and highlightDelta <= 1.4 then
+            if highlightDelta > 0.7 then
+                highlightDelta = 1.4 - highlightDelta
+            end
+
+            local rFraction, gFraction, bFraction = r2 - r1, g2 - g1, b2 - b1
+            r1 = r1 + rFraction * highlightDelta / 0.8
+            g1 = g1 + gFraction * highlightDelta / 0.8
+            b1 = b1 + bFraction * highlightDelta / 0.8
+        end
+
+        formattedText = formattedText .. ('\a%02x%02x%02x%02x%s'):format(r1, g1, b1, 255, character)
+    end
+    
+    ui.set(lua_enable, "❖ " ..text_to_slidedraw.one:format(formattedText))
+end
+
+local refs = {
+	enabled = ui.reference("AA", "Anti-aimbot angles", "Enabled"),
+	pitch = {ui.reference("AA", "Anti-aimbot angles", "pitch")},
+	roll = ui.reference("AA", "Anti-aimbot angles", "roll"),
+	yawbase = ui.reference("AA", "Anti-aimbot angles", "Yaw base"),
+	yaw = {ui.reference("AA", "Anti-aimbot angles", "Yaw")},
+	fsbodyyaw = ui.reference("AA", "anti-aimbot angles", "Freestanding body yaw"),
+	edgeyaw = ui.reference("AA", "Anti-aimbot angles", "Edge yaw"),
+	maxproccessticks = ui.reference("MISC", "Settings", "sv_maxusrcmdprocessticks2"),
+	yawjitter = {ui.reference("AA", "Anti-aimbot angles", "Yaw jitter")},
+	bodyyaw = {ui.reference("AA", "Anti-aimbot angles", "Body yaw")},
+	freestand = {ui.reference("AA", "Anti-aimbot angles", "Freestanding")},
+	onshotaa = {ui.reference("AA", "Other", "On shot anti-aim")},
+	slowmotion = {ui.reference("AA", "Other", "Slow motion")},
+	doubletap = {ui.reference("RAGE", "Aimbot", "Double tap")},
+	leg_movement = ui.reference("AA", "Other", "Leg movement"),
+    minimumdamageoverride = {ui.reference("RAGE", "Aimbot", "Minimum damage override")},
+	fakelag = ui.reference("AA", "Fake lag", "Enabled"),
+	fakeduck = ui.reference("RAGE", "Other", "Duck peek assist"),
+	clantag = ui.reference("MISC", "Miscellaneous", "Clan tag spammer")
+}
+
+local state_vars = {
+    player_states = {"stand", "move", "slowwalk", "air", "duck", "airduck", "fakelag"},
+
+    state_int = {
+        stand = 1,
+        move = 2,
+        slowwalk = 3,
+        air = 4,
+        duck = 5,
+        airduck = 6,
+		fakelag = 7
+    },
+
+    state_to_int = {
+        S = 1,
+        M = 2,
+        SW = 3,
+        A = 4,
+        D = 5,
+        AD = 6,
+		FL = 7
+    },
+
+    short_player_states = {"S", "M", "SW", "A", "D", "AD", "FL"},
+
+    player_state_holder = 1
+}
+
+local function does_contain(tbl, val)
+    for i=1, #tbl do
+        if tbl[i] == val then
+            return true
+        end
+    end
+    return false
+end
+
+local defhex = nil
+
+local main_colour = ui.new_color_picker("AA", "Anti-aimbot angles", "main colour", 191, 191, 236, 255)
+
+rgba_to_hex = function(b, c, d, e)
+    return string.format('%02x%02x%02x%02x', b, c, d, e)
+end
+
+local function processColor(main_colour)
+    local r, g, b, a = ui.get(main_colour)
+    return r, g, b, a
+end
+
+local function getcolour()
+    local rr, gg, bb = processColor(main_colour)
+    defhex = "\a"..rgba_to_hex(rr, gg, bb, 255)..""
+end
+
+getcolour()
+
+local lua_menu = ui.new_slider("AA", "Anti-aimbot angles", "\n", 1, 4, 1, true, '', 1, { [2] = defhex..'♯ \aFFFFFFFFanti-aimbot '..defhex..'♯', [1] = defhex..'♯ \aFFFFFFFFaimbot', [3] = defhex..'♯ \aFFFFFFFFvisuals '..defhex..'♯', [4] = defhex..'\aFFFFFFFFmiscellaneous '..defhex..'♯'})
+local lua_menu_spacer = ui.new_label("AA", "Anti-aimbot angles", "\n")
+
+local fl_reset = ui.new_checkbox("AA", "Anti-aimbot angles", "enable • "..defhex.."reset fakelag on land")
+
+local antiaim_state = ui.new_checkbox("AA", "Anti-aimbot angles", "enable • "..defhex.."anti-aim")
+
+local Builder = {}
+local builder_spacer = ui.new_label("AA", "Anti-aimbot angles", "\n")
+local defensive = ui.new_checkbox("AA", "Anti-aimbot angles", "enable • "..defhex.."exploit tickbase")
+local dis_jitter = ui.new_checkbox("AA", "Anti-aimbot angles", "enable • "..defhex.."static freestanding")
+local flick_fs = ui.new_checkbox("AA", "Anti-aimbot angles", "enable • "..defhex.."flicker freestanding")
+local freestand_key = ui.new_hotkey("AA", "Anti-aimbot angles", defhex.."freestanding")
+local current_state_select = ui.new_combobox("AA", "Anti-aimbot angles", "\n", "stand", "move", "slowwalk", "air", "duck", "airduck", "fakelag")
+local builder_label = ui.new_label("AA", "Anti-aimbot angles", "\n")
+
+for i=1, 7 do
+	Builder[i] = {
+		pitch = ui.new_combobox("AA", "Anti-aimbot angles","pitch • "..gradient_rgb(defr, defg, defb, defa, "mode").."\a0000000"..state_vars.player_states[i], "minimal", "up", "spam", "flicker"),
+		yaw = ui.new_combobox("AA", "Anti-aimbot angles","yaw • "..gradient_rgb(defr, defg, defb, defa, "mode").."\a0000000"..state_vars.player_states[i], "l + r", "spam", "delay"),
+		unsafedelay = ui.new_checkbox("AA", "Anti-aimbot angles","unsafe • "..gradient_rgb(defr, defg, defb, defa, "mode").."\a0000000"..state_vars.player_states[i]),
+		yawleft = ui.new_slider("AA", "Anti-aimbot angles","yaw • "..gradient_rgb(defr, defg, defb, defa, "left").."\a0000000"..state_vars.player_states[i], -180, 180, 0),
+		yawright = ui.new_slider("AA", "Anti-aimbot angles","yaw • "..gradient_rgb(defr, defg, defb, defa, "right").."\a0000000"..state_vars.player_states[i], -180, 180, 0),
+		yawjitter = ui.new_combobox("AA", "Anti-aimbot angles","jitter • "..gradient_rgb(defr, defg, defb, defa, "mode").."\a0000000"..state_vars.player_states[i], "off", "center"),
+		jitterdisabled = ui.new_label("AA", "Anti-aimbot angles", "\aa8a85fffyaw jitter can not be used with delay yaw"),
+		jitterdisabled1 = ui.new_label("AA", "Anti-aimbot angles", "\aa8a85fffunless unsafe mode used!"),
+		yawjitterslider = ui.new_slider("AA", "Anti-aimbot angles", "\n \a0000000"..state_vars.player_states[i], 0, 180, 0),
+		bodyoptions = ui.new_combobox("AA", "Anti-aimbot angles","body • "..gradient_rgb(defr, defg, defb, defa, "mode").."\a0000000"..state_vars.player_states[i], "off", "jitter", "opposite", "static"),
+		bodyoptionsslider = ui.new_slider("AA", "Anti-aimbot angles","\n"..state_vars.player_states[i], -180, 180, 0),
+		bodydisabled = ui.new_label("AA", "Anti-aimbot angles", "\aa8a85fffbody options can not be used with delay yaw"),
+		bodydisabled1 = ui.new_label("AA", "Anti-aimbot angles", "\aa8a85fffunless unsafe mode used!")
+	}
+end
+
+local main_colour_note = ui.new_label("AA", "Anti-aimbot angles", "\aa8a85fffnote: main colour does not affect menu colour")
+local clrvis_label = ui.new_label("AA", "Anti-aimbot angles", "\n")
+local watermark = ui.new_checkbox("AA", "Anti-aimbot angles", "enable • "..defhex.."watermark")
+local indicators = ui.new_multiselect("AA", "Anti-aimbot angles", "enable • "..defhex.."indicators", "minimum damage", "lag compensation")
+local clantag = ui.new_checkbox("AA", "Anti-aimbot angles", "enable • "..defhex.."clan tag spammer")
+
+local antibackstab = ui.new_checkbox("AA", "Anti-aimbot angles", "enable • "..defhex.."avoid backstab")
+local shittalk = ui.new_checkbox("AA", "Anti-aimbot angles", "enable • "..defhex.."chat spammer")
+local hitlogs = ui.new_checkbox("AA", "Anti-aimbot angles", "enable • "..defhex.."shot logger")
+local animbrk = ui.new_checkbox("AA", "Anti-aimbot angles", "enable • "..defhex.."leg movement")
+local animbrkwhat = ui.new_combobox("AA", "Anti-aimbot angles", "\n", "-", "modern", "moonwalk")
+local animbrkpitch = ui.new_combobox("AA", "Anti-aimbot angles", "\n", "-", "0 pitch", "0 pitch random")
+
+local function og_apply(state)
+	ui.set_visible(refs.enabled, state)
+	ui.set_visible(refs.pitch[1], state)
+	ui.set_visible(refs.pitch[2], state)
+	ui.set_visible(refs.roll, state)
+	ui.set_visible(refs.yawbase, state)
+	ui.set_visible(refs.yaw[1], state)
+	ui.set_visible(refs.yaw[2], state)
+	ui.set_visible(refs.yawjitter[1], state)
+	ui.set_visible(refs.yawjitter[2], state)
+	ui.set_visible(refs.bodyyaw[1], state)
+	ui.set_visible(refs.bodyyaw[2], state)
+	ui.set_visible(refs.freestand[1], state)
+	ui.set_visible(refs.freestand[2], state)
+	ui.set_visible(refs.fsbodyyaw, state)
+	ui.set_visible(refs.edgeyaw, state)
+end
+
+local function lua_apply()
+	state_vars.active_section = state_vars.state_int[ui.get(current_state_select)]
+	local is_aa = ui.get(lua_menu) == 2
+	local is_rage = ui.get(lua_menu) == 1
+	local is_vis = ui.get(lua_menu) == 3
+	local is_misc = ui.get(lua_menu) == 4
+	local is_aabden = ui.get(antiaim_state)
+
+	if is_rage then
+		ui.set_visible(fl_reset, true)
+	else
+		ui.set_visible(fl_reset, false)
+	end
+
+	if is_aa then
+		ui.set_visible(antiaim_state, true)
+		ui.set_visible(freestand_key, true)
+		ui.set_visible(current_state_select, true)
+	else
+		ui.set_visible(antiaim_state, false)
+		ui.set_visible(freestand_key, false)
+		ui.set_visible(current_state_select, false)
+	end
+
+	if is_vis then
+		ui.set_visible(watermark, true)
+		ui.set_visible(indicators, true)
+		ui.set_visible(clrvis_label, true)
+		ui.set_visible(clantag, true)
+		ui.set_visible(main_colour_note, true)
+	else
+		ui.set_visible(watermark, false)
+		ui.set_visible(indicators, false)
+		ui.set_visible(clrvis_label, false)
+		ui.set_visible(clantag, false)
+		ui.set_visible(main_colour_note, false)
+	end
+
+	if is_misc then
+		ui.set_visible(antibackstab, true)
+		ui.set_visible(hitlogs, true)
+		ui.set_visible(animbrk, true)
+		ui.set_visible(shittalk, true)
+	else
+		ui.set_visible(antibackstab, false)
+		ui.set_visible(hitlogs, false)
+		ui.set_visible(animbrk, false)
+		ui.set_visible(shittalk, false)
+	end
+
+	if is_misc and ui.get(animbrk) then
+		ui.set_visible(animbrkwhat, true)
+		ui.set_visible(animbrkpitch, true)
+	else
+		ui.set_visible(animbrkwhat, false)
+		ui.set_visible(animbrkpitch, false)
+	end
+
+	if is_aabden then
+		for i=1, 7 do
+			ui.set_visible(current_state_select, is_aa)
+			ui.set_visible(builder_spacer, is_aa)
+			if is_aabden then
+				ui.set_visible(defensive, is_aa)
+				ui.set_visible(freestand_key, is_aa)
+				ui.set_visible(dis_jitter, is_aa)
+				ui.set_visible(builder_label, is_aa)
+				ui.set_visible(flick_fs, is_aa)
+				ui.set_visible(Builder[i].pitch, state_vars.active_section == i and is_aa)
+				ui.set_visible(Builder[i].unsafedelay, state_vars.active_section == i and is_aa)
+				ui.set_visible(Builder[i].yaw, state_vars.active_section == i and is_aa)
+				ui.set_visible(Builder[i].yawleft, state_vars.active_section == i and ui.get(Builder[state_vars.active_section].yaw) ~= "spam" and is_aa)
+				ui.set_visible(Builder[i].yawright, state_vars.active_section == i and ui.get(Builder[state_vars.active_section].yaw) ~= "spam" and is_aa)
+				ui.set_visible(Builder[i].yawjitter, state_vars.active_section == i and is_aa)
+				ui.set_visible(Builder[i].yawjitterslider, state_vars.active_section == i and ui.get(Builder[state_vars.active_section].yawjitter) ~= "off" and is_aa)
+				ui.set_visible(Builder[i].jitterdisabled, state_vars.active_section == i and ui.get(Builder[state_vars.active_section].yaw) == "delay" and is_aa)
+				ui.set_visible(Builder[i].jitterdisabled1, state_vars.active_section == i and ui.get(Builder[state_vars.active_section].yaw) == "delay" and is_aa)
+				ui.set_visible(Builder[i].bodyoptions, state_vars.active_section == i and is_aa)
+				ui.set_visible(Builder[i].bodyoptionsslider, state_vars.active_section == i and ui.get(Builder[i].bodyoptions) ~= "off" and ui.get(Builder[i].bodyoptions) ~= "opposite" and ui.get(Builder[i].bodyoptions) ~= "jitter" and is_aa)
+				ui.set_visible(Builder[i].bodydisabled, state_vars.active_section == i and ui.get(Builder[state_vars.active_section].yaw) == "delay" and is_aa)
+				ui.set_visible(Builder[i].bodydisabled1, state_vars.active_section == i and ui.get(Builder[state_vars.active_section].yaw) == "delay" and is_aa)
+			else
+				ui.set_visible(defensive, false)
+				ui.set_visible(freestand_key, false)
+				ui.set_visible(dis_jitter, false)
+				ui.set_visible(builder_label, false)
+				ui.set_visible(flick_fs, false)
+				ui.set_visible(Builder[i].pitch, false)
+				ui.set_visible(Builder[i].unsafedelay, false)
+				ui.set_visible(Builder[i].yaw, false)
+				ui.set_visible(Builder[i].yawleft, false)
+				ui.set_visible(Builder[i].yawright, false)
+				ui.set_visible(Builder[i].yawjitter, false)
+				ui.set_visible(Builder[i].yawjitterslider, false)
+				ui.set_visible(Builder[i].jitterdisabled, false)
+				ui.set_visible(Builder[i].jitterdisabled1, false)
+				ui.set_visible(Builder[i].bodyoptions, false)
+				ui.set_visible(Builder[i].bodyoptionsslider, false)
+				ui.set_visible(Builder[i].bodydisabled, false)
+				ui.set_visible(Builder[i].bodydisabled1, false)
+			end
+		end
+	else
+		for i=1, 7 do
+			ui.set_visible(builder_spacer, false)
+			ui.set_visible(defensive, false)
+			ui.set_visible(freestand_key, false)
+			ui.set_visible(dis_jitter, false)
+			ui.set_visible(builder_label, false)
+			ui.set_visible(flick_fs, false)
+			ui.set_visible(current_state_select,false)
+			ui.set_visible(Builder[i].pitch, false)
+			ui.set_visible(Builder[i].unsafedelay, false)
+			ui.set_visible(Builder[i].yaw, false)
+			ui.set_visible(Builder[i].yawleft, false)
+			ui.set_visible(Builder[i].yawright, false)
+			ui.set_visible(Builder[i].yawjitter, false)
+			ui.set_visible(Builder[i].yawjitterslider, false)
+			ui.set_visible(Builder[i].jitterdisabled, false)
+			ui.set_visible(Builder[i].jitterdisabled1, false)
+			ui.set_visible(Builder[i].bodyoptions, false)
+			ui.set_visible(Builder[i].bodyoptionsslider, false)
+			ui.set_visible(Builder[i].bodydisabled, false)
+			ui.set_visible(Builder[i].bodydisabled1, false)
+		end
+	end
+end
+
+local logs = {}
+local dynamic = {}
+dynamic.__index = dynamic function dynamic.new(f, z, r, xi) f = math.max(f, 0.001) z = math.max(z, 0) local pif = math.pi * f local twopif = 2 * pif local a = z / pif local b = 1 / ( twopif * twopif ) local c = r * z / twopif return setmetatable({ a = a, b = b, c = c, px = xi, y = xi, dy = 0 }, dynamic) end function dynamic:update(dt, x, dx) if dx == nil then dx = ( x - self.px ) / dt self.px = x end self.y = self.y + dt * self.dy self.dy = self.dy + dt * ( x + self.c * dx - self.y - self.a * self.dy ) / self.b return self end function dynamic:get() return self.y end local function roundedRectangle(b, c, d, e, f, g, h, i, j, k) renderer.rectangle(b, c, d, e, f, g, h, i) renderer.circle(b, c, f - 8, g - 8, h - 8, i, k, -180, 0.25) renderer.circle(b + d, c, f - 8, g - 8, h - 8, i, k, 90, 0.25) renderer.rectangle(b, c - k, d, k, f, g, h, i) renderer.circle(b + d, c + e, f - 8, g - 8, h - 8, i, k, 0, 0.25) renderer.circle(b, c + e, f - 8, g - 8, h - 8, i, k, -90, 0.25) renderer.rectangle(b, c + e, d, k, f, g, h, i) renderer.rectangle(b - k, c, k, e, f, g, h, i) renderer.rectangle(b + d, c, k, e, f, g, h, i) end
+
+client.set_event_callback('paint', function()
+    local screen = {client.screen_size()}
+    for i = 1, #logs do
+        if not logs[i] then return end
+        if not logs[i].init then
+            logs[i].y = dynamic.new(2, 2, 0.01, -10)
+            logs[i].time = globals.tickcount() + 164
+            logs[i].init = true
+        end
+
+        local rr, gg, bb = logs[i].rr, logs[i].gg, logs[i].bb
+        local string_size = renderer.measure_text("c", logs[i].text)
+		
+		roundedRectangle(screen[1]/2-string_size/2-25, screen[2]-logs[i].y:get(), string_size+10, 16, rr, gg, bb, 35,"", 8)
+		roundedRectangle(screen[1]/2-string_size/2-25, screen[2]-logs[i].y:get(), string_size+10, 16, rr, gg, bb, 45,"", 7)
+		roundedRectangle(screen[1]/2-string_size/2-25, screen[2]-logs[i].y:get(), string_size+10, 16, rr, gg, bb, 55,"", 6)
+		roundedRectangle(screen[1]/2-string_size/2-25, screen[2]-logs[i].y:get(), string_size+10, 16, rr, gg, bb, 155,"", 5)
+
+        roundedRectangle(screen[1]/2-string_size/2-25, screen[2]-logs[i].y:get(), string_size+10, 16, 11, 11, 11, 255, "", 4)
+        renderer.text(screen[1]/2-20, screen[2]-logs[i].y:get()+8, 255,255,255,255, "c", 0, logs[i].text)
+
+        if tonumber(logs[i].time) < globals.tickcount() then
+            if logs[i].y:get() < -10 then
+                table.remove(logs, i)
+            else
+                logs[i].y:update(globals.frametime(), -50, nil)
+            end
+        else
+            logs[i].y:update(globals.frametime(), 20+(i*28), nil)
+        end
+		
+    end
+end)
+
+slide_animation = function(s, v, t)
+    return s + (v - s) * t
+end
+
+clamp = function(x, minval, maxval)
+    if x < minval then
+        return minval
+    elseif x > maxval then
+        return maxval
+    else
+        return x
+    end
+end
+
+local cfunc = function(x) if x == nil then return 0 end x = (x % 360 + 360) % 360 return x > 180 and x - 360 or x end
+
+local positions = {}
+local lc = false
+
+client.set_event_callback("setup_command", function(cmd)
+    local plocal = entity.get_local_player()
+    local origin = vector(entity.get_origin(plocal))
+    local time = 1 / globals.tickinterval()
+
+    if cmd.chokedcommands == 0 then
+        positions[#positions + 1] = origin
+
+        if #positions >= time then
+            local record = positions[time]
+            lc = (origin - record):lengthsqr() > 4096
+        end
+    end
+
+    if #positions > time then
+        table.remove(positions, 1)
+    end
+end)
+
+local previous_tag = ''
+
+client.set_event_callback("net_update_end", function()
+    local local_player = entity.get_local_player()
+    if not local_player or not ui.get(clantag) or ui.get(refs.clantag) then
+        return
+    end
+
+    local clantag_restore = false
+
+    if 0 then
+        local animation = {
+            "nemesis.lat",
+            "n3m3sis.lat"
+        }
+
+        --local latency = math.floor(client.latency()*1000) / globals.tickinterval()
+        local tickcount_prediction = globals.tickcount() + 1000
+        local current_iteration = math.floor(math.fmod(tickcount_prediction / 50, #animation) + 1)
+
+        if animation[current_iteration] ~= previous_tag then
+            client.set_clan_tag(animation[current_iteration])
+            previous_tag = animation[current_iteration]
+        end
+        clantag_restore = true
+    elseif clantag_restore then
+        client.set_clan_tag('')
+    end
+end)
+
+client.set_event_callback("setup_command", function(cmd)
+	local user_ground = bit.band(entity.get_prop(entity.get_local_player(), "m_fFlags"), 1) == 1
+	
+	if ui.get(fl_reset) then
+		ui.set_visible(refs.fakelag, false)
+		if user_ground == false then
+			ui.set(refs.fakelag, true)
+		elseif user_ground == true and client.key_state("0x20") then
+			ui.set(refs.fakelag, false)
+		end
+	else
+		ui.set_visible(refs.fakelag, true)
+	end
+
+end)
+
+local function draw_indicator_circle(ctx, x, y, r, g, b, a, radius, percentage)
+	client.draw_circle_outline(ctx, x, y, 0, 0, 0, 200, radius, 0, 1.0, 5)
+	client.draw_circle_outline(ctx, x, y, r, g, b, a, radius - 1, 0, percentage, 3)
+end
+
+client.set_event_callback("paint", function(ctx)
+    local localplayer = entity.get_local_player()
+	local screen_size = {client.screen_size()}
+	local rr, gg, bb = processColor(main_colour)
+	local string_size = renderer.measure_text("c", ui.get(refs.minimumdamageoverride[3]))
+	
+    if not entity.is_alive(entity.get_local_player()) then return end
+
+    if ui.get(refs.minimumdamageoverride[2]) and does_contain(ui.get(indicators), "minimum damage") then
+		roundedRectangle(screen_size[1] / 2 + 7, screen_size[2] / 2 - 14, string_size-3, 6, rr, gg, bb, 35, "", 2)
+		roundedRectangle(screen_size[1] / 2 + 7, screen_size[2] / 2 - 14, string_size-3, 6, rr, gg, bb, 45, "", 3)
+		roundedRectangle(screen_size[1] / 2 + 7, screen_size[2] / 2 - 14, string_size-3, 6, rr, gg, bb, 55, "", 4)
+		roundedRectangle(screen_size[1] / 2 + 7, screen_size[2] / 2 - 14, string_size-3, 6, rr, gg, bb, 105, "", 5)
+        renderer.text(screen_size[1] / 2 + 5, screen_size[2] / 2 - 17, 255, 255, 255, 175, "db", 0, ui.get(refs.minimumdamageoverride[3]) .. "")
+    end
+
+	if does_contain(ui.get(indicators), "lag compensation") then
+		local plocal = entity.get_local_player()
+		local flags = entity.get_prop(plocal, "m_fFlags")
+	
+		if bit.band(flags, 1) == 1 and not lc or not entity.is_alive(plocal) then
+			return
+		end
+	
+		local r, g, b, a = 240, 15, 15, 240
+	
+		if lc then
+			r, g, b = 160, 202, 43
+		end
+		
+		renderer.indicator(r, g, b, a, "LC")
+    end
+end)
+
+client.set_event_callback("setup_command", function(cmd)
+	if ui.get(defensive) then
+		cmd.force_defensive = globals.tickcount() % 3 ~= 1
+	else
+		return end
+end)
+
+local ground_ticks = 0
+local char_ptr = ffi.typeof('char*')
+local class_ptr = ffi.typeof('void***')
+local nullptr = ffi.new('void*')
+local native_GetClientEntity = vtable_bind('client.dll', 'VClientEntityList003', 3, 'void*(__thiscall*)(void*, int)')
+local animation_layer_t = ffi.typeof([[
+	struct {										char pad0[0x18];
+		uint32_t	sequence;
+		float		prev_cycle;
+		float		weight;
+		float		weight_delta_rate;
+		float		playback_rate;
+		float		cycle;
+		void		*entity;						char pad1[0x4];
+	} **
+]])
+
+client.set_event_callback("pre_render", function()
+	
+	if not entity.is_alive(entity.get_local_player()) then return end
+
+	local pEnt = ffi.cast(class_ptr, native_GetClientEntity(entity.get_local_player()))
+	if pEnt == nullptr then
+		return
+	end
+
+	local anim_layers = ffi.cast(animation_layer_t, ffi.cast(char_ptr, pEnt) + 0x2990)[0][6]
+	
+	local user_ground = bit.band(entity.get_prop(entity.get_local_player(), "m_fFlags"), 1) == 1
+
+	local lt = {[1] = "Off", [2] = "Always slide" , [3] = "Never slide"}
+
+	if entity.get_prop(entity.get_local_player(), 'm_hGroundEntity') then
+        ground_ticks = ground_ticks + 1
+    else
+        ground_ticks = 0
+    end
+
+	if ui.get(animbrk) then
+		ui.set_visible(refs.leg_movement, false)
+	else
+		ui.set_visible(refs.leg_movement, true)
+	end
+
+	if ui.get(animbrk) and ui.get(animbrkwhat) == "modern" and not user_ground then
+		entity.set_prop(entity.get_local_player(), 'm_flPoseParameter', 1, 6)
+	elseif ui.get(animbrk) and ui.get(animbrkwhat) == "moonwalk" and not user_ground then
+		anim_layers.weight = 1
+	end
+
+	if ui.get(animbrk) and ui.get(animbrkwhat) == "modern" then
+		ui.set(refs.leg_movement, lt[math.random(2,3)])
+		entity.set_prop(entity.get_local_player(), "m_flPoseParameter", math.random(0.1, 2), math.random(0,1)) 
+	elseif ui.get(animbrk) and ui.get(animbrkwhat) == "moonwalk" then
+		entity.set_prop(entity.get_local_player(), 'm_flPoseParameter', 0.5, 7)
+		ui.set(refs.leg_movement, lt[3])
+	end
+
+	if ui.get(animbrk) and ui.get(animbrkpitch) == "0 pitch" and ground_ticks > 5 and ground_ticks < 300 then
+		entity.set_prop(entity.get_local_player(), 'm_flPoseParameter', 0.5, 12)
+	elseif ui.get(animbrk) and ui.get(animbrkpitch) == "0 pitch random" and ground_ticks > 5 and ground_ticks < 300 then
+		entity.set_prop(entity.get_local_player(), 'm_flPoseParameter', math.random(0.5, 1), 12)
+	end
+
+end)
+
+function anti_knife_dist(x1, y1, z1, x2, y2, z2)
+    return math.sqrt((x2 - x1)^2 + (y2 - y1)^2 + (z2 - z1)^2)
+end
+
+client.set_event_callback("setup_command", function()
+        local players = entity.get_players(true)
+
+        local localoriginx, localoriginy, localoriginz = entity.get_prop(entity.get_local_player(), "m_vecOrigin")
+
+        for i=1, #players do
+            local playeroriginx, playeroriginy, playeroriginz = entity.get_prop(players[i], "m_vecOrigin")
+			local vel_x, vel_y = entity.get_prop(entity.get_local_player(), "m_vecVelocity")
+            local distance = anti_knife_dist(localoriginx, localoriginy, localoriginz, playeroriginx, playeroriginy, playeroriginz)
+
+            local weapon = entity.get_player_weapon(players[i])
+			if ui.get(antibackstab) then
+				if entity.get_classname(weapon) == "CKnife" and distance <= 250 + math.abs(math.floor(math.sqrt(vel_x * vel_x + vel_y * vel_y + 1000))) / 3 then
+					ui.set(refs.yaw[2], 180)
+					ui.set(refs.pitch[1], "Off")
+				end
+		   end
+	  end
+end)
+
+local function text_fade(x, y, s, c1, c2, text)
+    local texxt = ''
+    local curtime = globals.curtime()
+    for i = 0, #text do
+        local color = rgba_to_hex(
+            slide_animation(c1.r, c2.r, clamp(math.cos(1 * s * curtime / 4 + i * 10  / 15), 0, 1)),
+            slide_animation(c1.g, c2.g, clamp(math.cos(1 * s * curtime / 4 + i * 10  / 15), 0, 1)),
+            slide_animation(c1.b, c2.b, clamp(math.cos(1 * s * curtime / 4 + i * 10  / 15), 0, 1)),
+            c1.a
+        ) 
+        texxt = texxt .. '\a' .. color .. text:sub(i, i) 
+    end
+    renderer.text(x, y, c1.r, c1.g, c1.b, c1.a, "b", nil, texxt)
+end
+
+client.set_event_callback("paint", function()
+	local screen_size = {client.screen_size()}
+	local rr, gg, bb = processColor(main_colour)
+
+	if ui.get(watermark) then
+		text_fade(screen_size[1] / 2 + 860, screen_size[2] / 2, 15, {r=rr, g=gg, b=bb, a=255}, {r=255, g=255, b=255, a=255}, "N  E  M  E  S  I  S")
+	end
+end)
+
+client.set_event_callback("setup_command", function(c)
+	local tickcount = globals.tickcount()
+
+	if ui.get(freestand_key) then
+		ui.set(refs.freestand[1], true)
+		ui.set(refs.freestand[2], "Always on")
+	elseif ui.get(freestand_key) and ui.get(flick_fs) then
+		ui.set(refs.freestand[1], true)
+		ui.set(refs.freestand[2], "Always on")
+		c.in_use = cfunc((tickcount % 18 < 2 and 1 or 0))
+	else
+		ui.set(refs.freestand[1], false)
+		ui.set(refs.freestand[2], "Always on")
+	end	
+
+	local local_player = entity.get_local_player()
+	local vel_x, vel_y = entity.get_prop(local_player, "m_vecVelocity")
+	local user_standing = math.sqrt(vel_x ^ 2 + vel_y ^ 2) < 5
+	local user_ground = bit.band(entity.get_prop(local_player, "m_fFlags"), 1) == 1 and c.in_jump == 0
+	local user_slowmotion = ui.get(refs.slowmotion[1]) and ui.get(refs.slowmotion[2])
+	local is_os = ui.get(refs.onshotaa[1]) and ui.get(refs.onshotaa[2])
+	local is_dt = ui.get(refs.doubletap[1]) and ui.get(refs.doubletap[2])
+	local is_fd = ui.get(refs.fakeduck)
+
+	if not is_dt and not is_os or is_fd then
+		state_vars.player_state_holder = 7
+	elseif c.in_duck == 1 and user_ground then
+		state_vars.player_state_holder = 5
+	elseif c.in_duck == 1 and not user_ground then
+		state_vars.player_state_holder = 6
+	elseif not user_ground then
+		state_vars.player_state_holder = 4
+	elseif user_slowmotion then
+		state_vars.player_state_holder = 3
+	elseif user_standing then
+		state_vars.player_state_holder = 1
+	elseif not user_standing then
+		state_vars.player_state_holder = 2
+	end
+
+	local bodyyaw = entity.get_prop(entity.get_local_player(), "m_flPoseParameter", 11) * 120 - 60
+	local side = bodyyaw > 0 and 1 or -1
+
+	local metapitch = {[1] = client.random_int(-65,-45), [2] = 89, [3] = 89, [4] = 89}
+	local yawvaluer = {[1] = math.random(-50,50), [2] = math.random(-90,90), [3] = math.random(-120,120)}
+	local randomyaw = client.random_int(69,169)
+
+	if ui.get(antiaim_state) then
+		if ui.get(dis_jitter) and ui.get(freestand_key) then
+			ui.set(refs.pitch[1], "minimal")
+			ui.set(refs.yaw[2], 0)
+			ui.set(refs.yaw[1], "180")
+			ui.set(refs.yawbase, "at targets")
+			ui.set(refs.yawjitter[1], "off")
+			ui.set(refs.yawjitter[2], 0)
+			ui.set(refs.bodyyaw[1], "opposite")
+			ui.set(refs.bodyyaw[2], 0)
+		else
+		ui.set(refs.yawbase, "at targets")
+		ui.set(refs.bodyyaw[1], ui.get(Builder[state_vars.player_state_holder].bodyoptions))
+		ui.set(refs.bodyyaw[2], ui.get(Builder[state_vars.player_state_holder].bodyoptionsslider))
+		ui.set(refs.fsbodyyaw, false)
+		ui.set(refs.yawjitter[1], ui.get(Builder[state_vars.player_state_holder].yawjitter))
+		ui.set(refs.yawjitter[2], ui.get(Builder[state_vars.player_state_holder].yawjitterslider))
+
+		if ui.get(Builder[state_vars.player_state_holder].pitch) == "spam" then
+			ui.set(refs.pitch[1], "Custom")
+			ui.set(refs.pitch[2], cfunc((tickcount % 6 < 3 and -89 or 89)))
+		elseif ui.get(Builder[state_vars.player_state_holder].pitch) == "flicker" then
+			ui.set(refs.pitch[1], "Custom")
+			ui.set(refs.pitch[2], cfunc((tickcount % 30 < 2 and math.random(-89, -75) or 89)))
+		else
+			ui.set(refs.pitch[1], ui.get(Builder[state_vars.player_state_holder].pitch))
+		end
+
+		if ui.get(Builder[state_vars.player_state_holder].yaw) == "l + r" then
+			if c.chokedcommands == 0 then
+				ui.set(refs.yaw[1], "180")
+				ui.set(refs.yaw[2], (side == 1 and ui.get(Builder[state_vars.player_state_holder].yawleft) or ui.get(Builder[state_vars.player_state_holder].yawright)))
+			end
+		elseif ui.get(Builder[state_vars.player_state_holder].yaw) == "spam" then
+			ui.set(refs.yaw[1], "180")
+			ui.set(refs.yaw[2], cfunc((tickcount % 6 < 3 and randomyaw or -randomyaw)))
+		elseif ui.get(Builder[state_vars.player_state_holder].yaw) == "delay" then
+			if ui.get(Builder[state_vars.player_state_holder].unsafedelay) then
+				ui.set(refs.yaw[1], "180")
+			    ui.set(refs.yaw[2], cfunc((tickcount % 18 < 11 and ui.get(Builder[state_vars.player_state_holder].yawleft) or ui.get(Builder[state_vars.player_state_holder].yawright))))
+			else
+				ui.set(Builder[state_vars.player_state_holder].yawjitter, "off")
+			    ui.set(Builder[state_vars.player_state_holder].bodyoptions, "off")
+			    ui.set(refs.yaw[1], "180")
+			    ui.set(refs.yaw[2], cfunc((tickcount % 18 < 11 and ui.get(Builder[state_vars.player_state_holder].yawleft) or ui.get(Builder[state_vars.player_state_holder].yawright))))
+		end
+	  end
+	end
+  end
+end)
+
+local hitgroup_names = {
+    "generic", "head", "chest", "stomach", "left arm", "right arm", "left leg", "right leg", "neck", "unknown"
+}
+
+client.set_event_callback("aim_fire", function(event)
+    stored_shot = {
+		id = event.id,
+        damage = event.damage,
+        hitbox = hitgroup_names[event.hitgroup + 1],
+        lagcomp = event.teleported,
+        backtrack = globals.tickcount() - event.tick,
+		hitchance = event.hit_chance,
+		flags = {
+			event.teleported and 'T' or '',
+			event.interpolated and 'I' or '',
+			event.extrapolated and 'E' or '',
+			event.boosted and 'B' or '',
+			event.high_priority and 'H' or ''
+		}
+    }
+end)
+
+client.set_event_callback("aim_miss", function(event)
+	local output = {}
+	local actualhc = math.floor(event.hit_chance)
+
+    if ui.get(hitlogs) then
+		if event.reason == "?" then
+			output = string.format("MISS(%s) / %s / %s / %s / resolver / [aim=%s bt=%s]", stored_shot.id, entity.get_player_name(event.target), stored_shot.hitbox, stored_shot.damage, hitgroup_names[event.hitgroup + 1], stored_shot.backtrack)
+		elseif event.reason == "?" and 0 > stored_shot.backtrack then
+			output = string.format("MISS(%s) / %s / %s / %s / forwardtrack failure / [aim=%s bt=%s]", stored_shot.id, entity.get_player_name(event.target), stored_shot.hitbox, stored_shot.damage, hitgroup_names[event.hitgroup + 1], stored_shot.backtrack)
+		elseif event.reason == "?" and 10 < stored_shot.backtrack then
+			output = string.format("MISS(%s) / %s / %s / %s / backtrack failure / [aim=%s bt=%s]", stored_shot.id, entity.get_player_name(event.target), stored_shot.hitbox, stored_shot.damage, hitgroup_names[event.hitgroup + 1], stored_shot.backtrack)
+		else
+			output = string.format("MISS(%s) / %s / %s / %s / %s / [aim=%s bt=%s]", stored_shot.id, entity.get_player_name(event.target), stored_shot.hitbox, stored_shot.damage, event.reason, hitgroup_names[event.hitgroup + 1], stored_shot.backtrack)
+		end
+
+	print(output)
+	table.insert(logs, { text = output, rr = 255, gg = 50, bb = 50 })
+  end
+end)
+
+client.set_event_callback("aim_hit", function(event)
+	local output = {}
+	local actualhc = math.floor(event.hit_chance)
+
+	if ui.get(hitlogs) then
+		output = string.format("HIT(%s) / %s / %s / %s(%s) / [aim=%s bt=%s mismatch=%s]", stored_shot.id, entity.get_player_name(event.target), hitgroup_names[event.hitgroup + 1], event.damage, stored_shot.damage, stored_shot.hitbox, stored_shot.backtrack, (event.damage >= stored_shot.damage) and "FALSE" or "TRUE")
+	print(output)
+	table.insert(logs, { text = output, rr = 150, gg = 200, bb = 59 })
+  end
+end)
+
+local killphrases = {
+	'WEKE JUST UPDATED NEMESIS FOR SKEET TO V5 AND ITS POWER◣_◢◣_◢◣_◢',
+	'WEKE JUST UPDATED NEMESIS FOR SKEET TO V5 AND ITS POWER◣_◢◣_◢◣_◢',
+	'WEKE JUST UPDATED NEMESIS FOR SKEET TO V5 AND ITS POWER◣_◢◣_◢◣_◢',
+	'WEKE JUST UPDATED NEMESIS FOR SKEET TO V5 AND ITS POWER◣_◢◣_◢◣_◢',
+	'WEKE JUST UPDATED NEMESIS FOR SKEET TO V5 AND ITS POWER◣_◢◣_◢◣_◢',
+	'WEKE JUST UPDATED NEMESIS FOR SKEET TO V5 AND ITS POWER◣_◢◣_◢◣_◢',
+	'WEKE JUST UPDATED NEMESIS FOR SKEET TO V5 AND ITS POWER◣_◢◣_◢◣_◢',
+	'WEKE JUST UPDATED NEMESIS FOR SKEET TO V5 AND ITS POWER◣_◢◣_◢◣_◢',
+	'WEKE JUST UPDATED NEMESIS FOR SKEET TO V5 AND ITS POWER◣_◢◣_◢◣_◢',
+	'WEKE JUST UPDATED NEMESIS FOR SKEET TO V5 AND ITS POWER◣_◢◣_◢◣_◢',
+	'WEKE JUST UPDATED NEMESIS FOR SKEET TO V5 AND ITS POWER◣_◢◣_◢◣_◢',
+	'WEKE JUST UPDATED NEMESIS FOR SKEET TO V5 AND ITS POWER◣_◢◣_◢◣_◢',
+	'helo my naim ist WEKE me is use DEVELOPER VERSION of nemesis.lat!!!!!!',
+	'𝖊𝖓𝖏𝖔𝖞 𝖉𝖎𝖊 𝖙𝖔 nemesis 𝖑𝖚𝖆 𝖘𝖐𝖗𝖎𝖕𝖙',
+	'nemesis 𝓋𝓈 𝓃𝓃 𝒾𝓈 𝓌𝒾𝓃 𝓈𝑜 𝑒𝒶𝓈𝓎',
+	'𝕞𝕪 𝕔𝕙𝕖𝕒𝕥 𝕚𝕤 𝕦𝕤𝕖 𝕟𝕖𝕞𝕖𝕤𝕚𝕤 𝕣𝕖𝕤𝕠𝕝𝕧𝕖𝕣 𝕒𝕟𝕕 𝕙𝕖𝕕𝕤𝕙𝕠𝕥',
+	'ｎｉｃｅ ｍｉｓｓ ｄｏｇ ｏｗｎｅｄ １',
+	'ʙʏ ɴᴇᴍᴇꜱɪꜱ',
+	'ʷʰᵉⁿ ᵍᵃᵐᵉ ˢᵗᵃʳᵗ ʸᵒᵘ ⁱˢ ˡᵒˢᵉ ᵃˡʳᵉᵃᵈʸ',
+	'𝐮𝐫 𝐥𝐮𝐚 𝐜𝐫𝐚𝐜𝐤𝐞𝐝 𝐥𝐢𝐤𝐞 𝐞𝐠𝐠',
+	'YӨЦ ΛЯΣПƬ ЩIП ƧЯY.',
+	'♥ after contact sigma i hs and smile ♥',
+	'𝖋𝖗𝖊𝖊 𝖍𝖛𝖍 2020-2022 𝖑𝖊𝖘𝖘𝖔𝖓 𝖞𝖔𝖚𝖙𝖚𝖇𝖊.𝖈𝖔𝖒/makihvh',
+	'ｇｏｄ ｉｓ ｇｉｖｅ ｍｅ ｐｏｗｅｒ ｔｏ ｈｅａｄｓｈｏｔ ｙｏｕ',
+	'you is owned by nemesis lua for 𝖌𝖆𝖒𝖊𝖘𝖊𝖓𝖘𝖊',
+	'1',
+	'privat doubltap peak solution ◣_◢',
+	'𝖚𝖗 𝖆𝖓𝖙𝖎𝖆𝖎𝖒𝖇𝖔𝖙 𝖎𝖘 𝖘𝖔𝖑𝖛𝖊 𝖇𝖞 𝖗𝖊𝖘𝖔𝖑𝖛𝖊𝖗 𝕟𝕖𝕞𝕖𝕤𝕚𝕤 ◣_◢◣_◢◣_◢',
+	'sowwy >_<',
+	'𝕨𝕙𝕖𝕟 𝕚 𝕣𝕖𝕔𝕖𝕚𝕧 𝕓𝕖𝕥𝕒 𝕟𝕖𝕞𝕖𝕤𝕚𝕤 LUASH 𝕚 +𝕨 𝕚𝕟𝕥𝕠 𝕦 (◣_◢)',
+	'ｅｘｅｃｕｔｅ ｒａｔ．ｅｘｅ ｄｏｎｅ．',
+	'𝖙𝖗𝖔𝖑𝖑𝖊𝖉◣__◢',
+	'𝕨𝕙𝕖𝕟 𝕚 𝕤𝕖𝕖 𝕨𝕖𝕜𝕖 𝕚 𝕣𝕖𝕡𝕠𝕣𝕥 𝕡𝕣𝕚𝕞𝕠𝕣𝕕𝕚𝕒𝕝 𝕒𝕔c𝕠𝕟𝕥 (◣_◢)',
+	'𝕨𝕙𝕖𝕟 𝕚 𝕤𝕖𝕖 𝕨𝕖𝕜𝕖 𝕚 𝕣𝕖𝕡𝕠𝕣𝕥 𝕡𝕣𝕚𝕞𝕠𝕣𝕕𝕚𝕒𝕝 𝕒𝕔c𝕠𝕟𝕥 (◣_◢)',
+	'𝕨𝕙𝕖𝕟 𝕚 𝕤𝕖𝕖 𝕨𝕖𝕜𝕖 𝕚 𝕣𝕖𝕡𝕠𝕣𝕥 𝕡𝕣𝕚𝕞𝕠𝕣𝕕𝕚𝕒𝕝 𝕒𝕔c𝕠𝕟𝕥 (◣_◢)',
+	'𝕨𝕙𝕖𝕟 𝕚 𝕤𝕖𝕖 𝕨𝕖𝕜𝕖 𝕚 𝕣𝕖𝕡𝕠𝕣𝕥 𝕡𝕣𝕚𝕞𝕠𝕣𝕕𝕚𝕒𝕝 𝕒𝕔c𝕠𝕟𝕥 (◣_◢)',
+	'when i see weke uid 386 on primordial i report his prim account axaxax (◣_◢)',
+	'when i see weke uid 386 on primordial i report his prim account axaxax (◣_◢)',
+	'when i see weke uid 386 on primordial i report his prim account axaxax (◣_◢)',
+	'when i see weke uid 386 on primordial i report his prim account axaxax (◣_◢)',
+	'when i see weke uid 386 on primordial i report his prim account axaxax (◣_◢)',
+	'when i see weke uid 386 on primordial i report his prim account axaxax (◣_◢)',
+	'uu ʇǝǝʞs ʎnq oɓ ǝsn ǝʇsɐd ɓop ǝɔıu',
+	'𝔽ℝ𝔼𝔼 𝕃𝕌𝔸 𝕋𝕆𝕄𝕆ℝℝ𝕆𝕎!',
+	'𝕘𝕨𝕒𝕞𝕖𝕤𝕨𝕖𝕟𝕤𝕖 𝔸ℕ𝕋𝕀-𝔸𝕀𝕄 ℍ𝔼𝔸𝔻𝕊ℍ𝕆𝕋 ℙℝ𝔼𝔻𝕀ℂ𝕋',
+	'𝔂𝓸𝓾 𝓱𝓪𝓿𝓮 𝓾𝓷𝓾𝓼𝓮𝓭 𝓲𝓷𝓿𝓲𝓽𝓪𝓽𝓲𝓸𝓷 𝓬𝓸𝓭𝓮𝓼 ◣_◢',
+	'ᴡᴀʀɴɪɴɢ: ɢᴏɪɴɢ ᴛᴏ ꜱʟᴇᴇᴘ ᴏɴ ꜱᴜɴᴅᴀʏ ᴡɪʟʟ ᴄᴀᴜꜱᴇ ᴍᴏɴᴅᴀʏ',
+	'𝕝𝕖𝕘𝕚𝕥 𝕚𝕤 𝕥𝕦𝕣𝕟 𝕚𝕟 𝕙𝕧𝕙 𝕞𝕒𝕥𝕔𝕙𝕒𝕞𝕜𝕚𝕟𝕘 𝕗𝕥. 𝕠𝕥𝕔𝕧𝟚 (◣_◢)',
+	'𝓼𝓸 𝓲 𝓶𝓲𝓰𝓱𝓽 𝓫𝓮 𝓼𝓮𝓵𝓵𝓲𝓷𝓰 𝓷𝓮𝓿𝓮𝓻𝓵𝓸𝓼𝓮 𝓲𝓷𝓿𝓲𝓽𝓪𝓽𝓲𝓸𝓷...',
+	'𝟙𝕧𝟙 𝕧𝕤 𝕕𝕖𝕕𝕡𝕠𝕝 𝕚𝕤 𝕨𝕚𝕟 𝕓𝕖𝕔𝕦𝕤 𝕙𝕖 𝕒𝕣𝕖 𝕟𝕠𝕥 𝕦𝕤𝕖 𝕒𝕕𝕒𝕡𝕥𝕚𝕧𝕖 ◣_◢',
+	'𝕨𝕙𝕖𝕟 𝕚 𝕖𝕩𝕚𝕥𝕤𝕔𝕒𝕞 𝕒𝕟𝕕 𝕓𝕒𝕟 𝕥𝕙𝕖 𝕔𝕠𝕕𝕖𝕣 𝕚 𝕙𝕤 𝕒𝕟𝕕 𝕤𝕞𝕚𝕝𝕖',
+	'𝕨𝕙𝕖𝕟 𝕚 𝕖𝕩𝕚𝕥𝕤𝕔𝕒𝕞 𝕒𝕟𝕕 𝕓𝕒𝕟 𝕥𝕙𝕖 𝕔𝕠𝕕𝕖𝕣 𝕚 𝕙𝕤 𝕒𝕟𝕕 𝕤𝕞𝕚𝕝𝕖',
+	'𝕨𝕙𝕖𝕟 𝕚 𝕖𝕩𝕚𝕥𝕤𝕔𝕒𝕞 𝕒𝕟𝕕 𝕓𝕒𝕟 𝕥𝕙𝕖 𝕔𝕠𝕕𝕖𝕣 𝕚 𝕙𝕤 𝕒𝕟𝕕 𝕤𝕞𝕚𝕝𝕖',
+	'𝕨𝕙𝕖𝕟 𝕚 𝕖𝕩𝕚𝕥𝕤𝕔𝕒𝕞 𝕒𝕟𝕕 𝕓𝕒𝕟 𝕥𝕙𝕖 𝕔𝕠𝕕𝕖𝕣 𝕚 𝕙𝕤 𝕒𝕟𝕕 𝕤𝕞𝕚𝕝𝕖',
+	'𝕨𝕙𝕖𝕟 𝕚 𝕖𝕩𝕚𝕥𝕤𝕔𝕒𝕞 𝕒𝕟𝕕 𝕓𝕒𝕟 𝕥𝕙𝕖 𝕔𝕠𝕕𝕖𝕣 𝕚 𝕙𝕤 𝕒𝕟𝕕 𝕤𝕞𝕚𝕝𝕖',
+	'𝕨𝕙𝕖𝕟 𝕚 𝕖𝕩𝕚𝕥𝕤𝕔𝕒𝕞 𝕒𝕟𝕕 𝕓𝕒𝕟 𝕥𝕙𝕖 𝕔𝕠𝕕𝕖𝕣 𝕚 𝕙𝕤 𝕒𝕟𝕕 𝕤𝕞𝕚𝕝𝕖',
+	'𝕨𝕙𝕖𝕟 𝕚 𝕖𝕩𝕚𝕥𝕤𝕔𝕒𝕞 𝕒𝕟𝕕 𝕓𝕒𝕟 𝕥𝕙𝕖 𝕔𝕠𝕕𝕖𝕣 𝕚 𝕙𝕤 𝕒𝕟𝕕 𝕤𝕞𝕚𝕝𝕖',
+	'LUCKBOOST.CFG <-- UR CFG RN',
+	'LUCKBOOST.CFG <-- UR CFG RN',
+	'LUCKBOOST.CFG <-- UR CFG RN',
+	"𝕙𝕖𝕙𝕖𝕙𝕖, 𝕦 𝕘𝕣𝕒𝕓 𝕞𝕪 𝕗𝕒𝕝𝕝 𝕘𝕦𝕪𝕤 𝕔𝕙𝕒𝕣𝕒𝕔𝕥𝕖 ",
+	"𝕙𝕖𝕙𝕖𝕙𝕖, 𝕦 𝕘𝕣𝕒𝕓 𝕞𝕪 𝕗𝕒𝕝𝕝 𝕘𝕦𝕪𝕤 𝕔𝕙𝕒𝕣𝕒𝕔𝕥𝕖 ",
+	"𝕔𝕠𝕞𝕖 𝕞𝕖𝕖𝕥 𝕞𝕪 𝕙𝕖𝕝𝕝𝕠 𝕜𝕚𝕥𝕥𝕪 𝕥𝕖𝕒𝕞 >.<",
+	"𝕔𝕠𝕞𝕖 𝕞𝕖𝕖𝕥 𝕞𝕪 𝕙𝕖𝕝𝕝𝕠 𝕜𝕚𝕥𝕥𝕪 𝕥𝕖𝕒𝕞 >.<",
+	"𝕔𝕠𝕞𝕖 𝕞𝕖𝕖𝕥 𝕞𝕪 𝕙𝕖𝕝𝕝𝕠 𝕜𝕚𝕥𝕥𝕪 𝕥𝕖𝕒𝕞 >.<",
+	"𝒸𝑜𝓂𝑒 𝓂𝑒𝑒𝓉 𝓂𝓎 𝒽𝑒𝓁𝓁𝑜 𝓀𝒾𝓉𝓉𝓎 𝓉𝑒𝒶𝓂 >.<",
+	"𝒸𝑜𝓂𝑒 𝓂𝑒𝑒𝓉 𝓂𝓎 𝒽𝑒𝓁𝓁𝑜 𝓀𝒾𝓉𝓉𝓎 𝓉𝑒𝒶𝓂 >.<",
+	"𝒸𝑜𝓂𝑒 𝓂𝑒𝑒𝓉 𝓂𝓎 𝒽𝑒𝓁𝓁𝑜 𝓀𝒾𝓉𝓉𝓎 𝓉𝑒𝒶𝓂 >.<",
+	"WHEN IM MAKIHVH I EXITSCAM FOR 1 EURO AND SMILE☹☹",
+	"WHEN IM MAKIHVH I EXITSCAM FOR 1 EURO AND SMILE☹☹",
+	"WHEN IM MAKIHVH I EXITSCAM FOR 1 EURO AND SMILE☹☹",
+	"WHEN IM MAKIHVH I EXITSCAM FOR 1 EURO AND SMILE☹☹",
+	"WHEN IM MAKIHVH I EXITSCAM FOR 1 EURO AND SMILE☹☹",
+	"WHEN IM MAKIHVH I EXITSCAM FOR 1 EURO AND SMILE☹☹",
+	"𝕨𝕙𝕖𝕟 𝕚 𝕞𝕖𝕖𝕥 𝕓𝕣𝕒𝕥𝕧𝕒 𝕚 𝕤𝕒𝕪 𝟙 𝕓𝕚𝕔𝕦𝕫 𝕚𝕞 𝕤𝕚𝕘𝕞𝕒",
+	"𝕨𝕙𝕖𝕟 𝕚 𝕞𝕖𝕖𝕥 𝕓𝕣𝕒𝕥𝕧𝕒 𝕚 𝕤𝕒𝕪 𝟙 𝕓𝕚𝕔𝕦𝕫 𝕚𝕞 𝕤𝕚𝕘𝕞𝕒",
+	"𝕨𝕙𝕖𝕟 𝕚 𝕞𝕖𝕖𝕥 𝕓𝕣𝕒𝕥𝕧𝕒 𝕚 𝕤𝕒𝕪 𝟙 𝕓𝕚𝕔𝕦𝕫 𝕚𝕞 𝕤𝕚𝕘𝕞𝕒",
+	"𝕨𝕙𝕖𝕟 𝕚 𝕞𝕖𝕖𝕥 𝕓𝕣𝕒𝕥𝕧𝕒 𝕚 𝕤𝕒𝕪 𝟙 𝕓𝕚𝕔𝕦𝕫 𝕚𝕞 𝕤𝕚𝕘𝕞𝕒",
+	"WHEN I SEE ORCUS.RAT/BRATVA POP UP ON MY PC I DIE FROM LAUGHTER",
+	"WHEN I SEE ORCUS.RAT/BRATVA POP UP ON MY PC I DIE FROM LAUGHTER",
+	"GAMSNZ ACCUNT STOLEN SUCESSFULLY BY LIMEPOLISH",
+	"GAMSNZ ACCUNT STOLEN SUCESSFULLY BY LIMEPOLISH",
+	"GAMSNZ ACCUNT STOLEN SUCESSFULLY BY LIMEPOLISH",
+	"GAMSNZ ACCUNT STOLEN SUCESSFULLY BY LIMEPOLISH",
+	"𝐿𝐼𝑀𝐸𝒫𝒪𝐿𝐼𝒮𝐻: !𝒮𝒞𝑅𝐸𝐸𝒩𝒮𝐻𝒪𝒯",
+	"𝐿𝐼𝑀𝐸𝒫𝒪𝐿𝐼𝒮𝐻: !𝒮𝒞𝑅𝐸𝐸𝒩𝒮𝐻𝒪𝒯",
+	"𝐿𝐼𝑀𝐸𝒫𝒪𝐿𝐼𝒮𝐻: !𝒮𝒞𝑅𝐸𝐸𝒩𝒮𝐻𝒪𝒯",
+	"*DEAD* ☂ nossa vei : i need a good wanheda.red cfg",
+	"*DEAD* ☂ nossa vei : i need a good wanheda.red cfg",
+	"*DEAD* ☂ nossa vei : i need a good wanheda.red cfg",
+	"*DEAD* ☂ nossa vei : i need a good wanheda.red cfg"
+}
+
+local function get_table_length(data)
+  if type(data) ~= 'table' then
+    return 0
+  end
+  local count = 0
+  for _ in pairs(data) do
+    count = count + 1
+  end
+  return count
+end
+
+local killphrases_length = get_table_length(killphrases)
+
+local function on_player_death(e)
+	local victim_userid, attacker_userid = e.userid, e.attacker
+	if victim_userid == nil or attacker_userid == nil then return end
+
+	local victim_entindex = client.userid_to_entindex(victim_userid)
+	local attacker_entindex = client.userid_to_entindex(attacker_userid)
+
+	if attacker_entindex == entity.get_local_player() and entity.is_enemy(victim_entindex) and ui.get(shittalk) then
+		local commandbaim = 'say ' .. killphrases[math.random(killphrases_length)]
+		client.exec(commandbaim)
+	end
+end
+
+client.set_event_callback("player_death", on_player_death)
+
+local alphabet = "base64"
+
+local function system_export()
+	local export = {}
+	for key, value in pairs(state_vars.short_player_states) do
+		export[tostring(value)] = {}
+		for k, v in pairs(Builder[key]) do
+			export[value][k] = ui.get(v)
+		end
+	end
+	local exported = json.stringify(export)
+	local encoded = base64.encode(exported, alphabet)
+	clipboard.set(encoded)
+	table.insert(logs, {
+		text = "Config Exported.",
+		rr = 191,
+				gg = 191,
+				bb = 236
+	})
+end
+
+local function system_import()
+	local imported = json.parse(base64.decode(clipboard.get(), alphabet))
+	for key, value in pairs(state_vars.short_player_states) do
+		for k, v in pairs(Builder[key]) do
+			local current = imported[value][k]
+			if (current ~= nil) then
+				ui.set(v, current)
+			end
+		end
+	end
+	table.insert(logs, {
+		text = "Config Imported.",
+		rr = 191,
+				gg = 191,
+				bb = 236
+	})
+end
+
+local function extractKey(jsonString)
+    local keyStart = string.find(jsonString, ':"') -- Find the position where the key starts
+    local keyEnd = string.find(jsonString, '"}', keyStart + 2) -- Find the position where the key ends
+
+    if keyStart and keyEnd then
+        return string.sub(jsonString, keyStart + 2, keyEnd - 1) -- Extract the substring containing the key value
+    else
+        return nil
+    end
+end
+
+local function system_export_pastebin()
+	local export = {}
+	for key, value in pairs(state_vars.short_player_states) do
+		export[tostring(value)] = {}
+		for k, v in pairs(Builder[key]) do
+			export[value][k] = ui.get(v)
+		end
+	end
+	
+	local exported = json.stringify(export)
+	local encoded = base64.encode(exported, alphabet)
+	local text_depend = ""
+	http.post("https://hastebin.skyra.pw/documents", { body = ""..encoded.."", headers = { ['Content-Type'] = 'application/x-www-form-urlencoded' } }, function(success, response)
+        if success then
+			table.insert(logs, {
+				text = "Config uploaded, link in console.",
+				rr = 191,
+				gg = 191,
+				bb = 236
+			})
+			print("https://hastebin.skyra.pw/raw/"..extractKey(response.body)..".txt")
+			clipboard.set("https://hastebin.skyra.pw/raw/"..extractKey(response.body)..".txt")
+        else
+			table.insert(logs, {
+				text = "Connection failed. Contact staff.",
+				rr = 234,
+				gg = 147,
+				bb = 190
+			})
+        end
+    end)
+end
+
+local button_import = ui.new_button("AA", "Anti-aimbot angles",defhex.."import", system_import)
+local button_export = ui.new_button("AA", "Anti-aimbot angles",defhex.."export", system_export)
+local button_export_pst = ui.new_button("AA", "Anti-aimbot angles",defhex.."export + upload", system_export_pastebin)
+
+local function config_apply()
+	
+	state_vars.active_section = state_vars.state_int[ui.get(current_state_select)]
+	local is_aa = ui.get(lua_menu) == 2
+	local is_rage = ui.get(lua_menu) == 1
+	local is_vis = ui.get(lua_menu) == 3
+	local is_misc = ui.get(lua_menu) == 4
+	local is_aabden = ui.get(antiaim_state)
+
+	if is_aabden and is_aa then
+		ui.set_visible(button_import, true)
+		ui.set_visible(button_export, true)
+		ui.set_visible(button_export_pst, true)
+	else
+		ui.set_visible(button_import, false)
+		ui.set_visible(button_export, false)
+		ui.set_visible(button_export_pst, false)
+	end
+
+end
+
+client.set_event_callback("paint_ui", lua_apply)
+client.set_event_callback("paint_ui", og_apply)
+client.set_event_callback("paint_ui", config_apply)
+client.set_event_callback("shutdown", function()
+	og_apply(true)
+	ui.set_visible(refs.fakelag, true)
+	ui.set_visible(refs.leg_movement, true)
+end)
+
+client.set_event_callback("paint_ui", function()
+	og_apply(false)
+end)
+
+client.set_event_callback("paint_ui", gradient_rgbslide)
