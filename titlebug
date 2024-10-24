@@ -1,5 +1,5 @@
-GameSense forums operate on FluxBB, which has a very hard time filtering random characters if you mess with it enough.
+The GameSense forums run on FluxBB, which struggles to filter out random characters if manipulated extensively.
 
-To have the bugged title, completely breaking ur user profile set the string below as ur title and save (without {}).
+To create a bugged title that disrupts your user profile, set your title to the string below and save it (without the {}):
 
 { ë е}
